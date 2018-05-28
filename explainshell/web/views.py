@@ -1,7 +1,7 @@
 import logging, itertools, urllib
 import markupsafe
 
-from flask import render_template, request, redirect
+from flask import render_template, request, redirect, jsonify
 
 import bashlex.errors
 
@@ -18,40 +18,82 @@ def index():
 def about():
     return render_template('about.html')
 
-@app.route('/explain')
+def merge_lists(l1, l2, key):
+    merged = {}
+    for item in l1+l2:
+        if item[key] in merged:
+            merged[item[key]].update(item)
+        else:
+            merged[item[key]] = item
+    return [val for (_, val) in merged.items()]
+
 def explain():
     if 'cmd' not in request.args or not request.args['cmd'].strip():
-        return redirect('/')
+        return { 'status': 'nocommand' }
     command = request.args['cmd'].strip()
     command = command[:1000] # trim commands longer than 1000 characters
     if '\n' in command:
-        return render_template('errors/error.html', title='parsing error!',
-                               message='no newlines please')
+        return {
+            'status': 'error',
+            'title': 'parsing error!',
+            'message': 'no newlines please'
+        }
 
     s = store.store('explainshell', config.MONGO_URI)
     try:
         matches, helptext = explaincommand(command, s)
-        return render_template('explain.html',
-                               matches=matches,
-                               helptext=helptext,
-                               getargs=command)
+        return {
+            'status': 'success',
+            'matches': matches,
+            'helptext': helptext,
+            'getargs': command
+        }
 
     except errors.ProgramDoesNotExist, e:
-        return render_template('errors/missingmanpage.html', title='missing man page', e=e)
+        return { 'status': 'missingmanpage', 'e': e, 'title': 'missing man page' }
     except bashlex.errors.ParsingError, e:
         logger.warn('%r parsing error: %s', command, e.message)
-        return render_template('errors/parsingerror.html', title='parsing error!', e=e)
+        return { 'status': 'parsingerror', 'e': e }
     except NotImplementedError, e:
         logger.warn('not implemented error trying to explain %r', command)
         msg = ("the parser doesn't support %r constructs in the command you tried. you may "
                "<a href='https://github.com/idank/explainshell/issues'>report a "
                "bug</a> to have this added, if one doesn't already exist.") % e.args[0]
 
-        return render_template('errors/error.html', title='error!', message=msg)
+        return { 'status': 'error', 'message': msg }
     except:
         logger.error('uncaught exception trying to explain %r', command, exc_info=True)
         msg = 'something went wrong... this was logged and will be checked'
-        return render_template('errors/error.html', title='error!', message=msg)
+        return { 'status': 'error', 'message': msg }
+
+
+@app.route('/api/explain')
+def explain_json():
+    result = explain()
+    if result['status'] is not 'success':
+        if 'e' in result:
+            result['e'] = repr(result['e'])
+        return jsonify(result)
+    else:
+        helpItemsDicts = [{ 'helpHTML': helpItem[0], 'helpclass': helpItem[1] } for helpItem in result['helptext']]
+        matches = merge_lists(result['matches'], helpItemsDicts, "helpclass")
+        for d in matches:
+            del d['helpclass']
+        return jsonify({ 'matches': matches })
+
+@app.route('/explain')
+def explain_html():
+    result = explain()
+    if result['status'] is 'success':
+        return render_template('explain.html', **result)
+    elif result['status'] is 'error':
+        return render_template('errors/error.html', **result)
+    elif result['status'] is 'missingmanpage':
+        return render_template('errors/missingmanpage.html', **result)
+    elif result['status'] is 'parsingerror':
+        return render_template('errors/parsingerror.html', **result)
+    elif result['status'] is 'nocommand':
+        return redirect('/')
 
 @app.route('/explain/<program>', defaults={'section' : None})
 @app.route('/explain/<section>/<program>')
